@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -172,6 +173,68 @@ func countWords(file *os.File) (int, error) {
 	}
 	_, err := file.Seek(0, io.SeekStart)
 	return count, err
+}
+
+func parseOpenFileCount(value string) (int, error) {
+	count, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	maxInt := int(^uint(0) >> 1)
+	if count > uint64(maxInt) {
+		return maxInt, nil
+	}
+	return int(count), nil
+}
+
+func maxOpenFiles() (int, bool, error) {
+	if runtime.GOOS != "linux" {
+		return 0, false, nil
+	}
+
+	data, err := os.ReadFile("/proc/self/limits")
+	if err != nil {
+		return 0, true, err
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "Max open files") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 4 {
+			return 0, true, fmt.Errorf("unexpected content in /proc/self/limits")
+		}
+		if parts[3] == "unlimited" {
+			return int(^uint(0) >> 1), true, nil
+		}
+		maxFiles, err := parseOpenFileCount(parts[3])
+		if err != nil {
+			return 0, true, err
+		}
+		return maxFiles, true, nil
+	}
+	return 0, true, fmt.Errorf("max open files limit not found in /proc/self/limits")
+}
+
+func currentOpenFiles() (int, bool, error) {
+	if runtime.GOOS != "linux" {
+		return 0, false, nil
+	}
+
+	data, err := os.ReadFile("/proc/sys/fs/file-nr")
+	if err != nil {
+		return 0, true, err
+	}
+	parts := strings.Fields(string(data))
+	if len(parts) < 1 {
+		return 0, true, fmt.Errorf("unexpected content in /proc/sys/fs/file-nr")
+	}
+	openFiles, err := parseOpenFileCount(parts[0])
+	if err != nil {
+		return 0, true, err
+	}
+	return openFiles, true, nil
 }
 
 func normalizeThreadCount(requested int) (int, error) {
