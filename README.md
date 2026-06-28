@@ -1,101 +1,108 @@
 # S3 Bucket Scanner
 
-This Go program is designed to scan S3 bucket URLs to check their availability and determine if they are public. It generates potential S3 bucket names based on a provided wordlist and optional modifiers, then checks if those buckets exist.
+This Go CLI generates possible S3 bucket names from a wordlist and optional modifiers, then probes each generated bucket URL with the `?uploads=` query. A `200 OK` result means the multipart upload listing probe succeeded for that bucket endpoint; it is not a complete proof that the bucket is generally public or that objects are publicly readable.
 
-The program runs multithreaded HTTP requests and reports the results, including total requests, successes, failures, and progress during execution.
+Only scan buckets that you own or are authorized to assess.
 
 ## Features
 
-- Multithreaded scanning of S3 buckets
-- Custom wordlists for bucket names
-- Dynamic modifier input through an optional file
-- Automatically determines the output file if not provided
-- Detailed progress and statistics reporting
-- Adjustable concurrency (threads)
-- Verbose mode for more detailed logs
-
-## Table of Contents
-
-- [Installation](#installation)
-- [Usage](#usage)
-- [Parameters](#parameters)
-- [Examples](#examples)
+- Concurrent S3 bucket endpoint probing
+- Custom wordlists for bucket-name candidates
+- Optional modifier files for expanded candidate generation
+- Bounded worker pipeline instead of precomputing every URL
+- Configurable concurrency
+- Request timeouts to avoid stalled scans
+- Progress and result output
+- Cross-platform build support with Linux-only file-descriptor telemetry when available
 
 ## Installation
 
-1. Ensure you have Go installed on your machine. You can download it from [Go's official site](https://golang.org/dl/).
+1. Install Go `1.25.11` or newer in the active Go 1.25 release line.
 2. Clone this repository:
-   ```
+   ```sh
    git clone https://github.com/doug147/s3scanner.git
    cd s3scanner
    ```
-3. Build the Go program:
-   ```
+3. Build the CLI:
+   ```sh
    go build -o s3scanner .
    ```
 
+On Windows, the output binary will normally be `s3scanner.exe` unless you provide a different `-o` value to `go build`.
+
 ## Usage
 
-The program takes a wordlist of potential bucket names as input, generates potential S3 bucket URLs, and checks their availability.
-
-Basic command:
-```
-./s3scanner -i <input-file> [-o <output-file>] [-t <threads>] [-v] [-modifiers <modifiers-file>]
+```sh
+./s3scanner -i <input-file> [-o <output-file>] [-t <threads>] [-v] [-m <modifiers-file>]
 ```
 
-If no output file is specified, the results will be saved in a file named `output-<unix_epoch_time>.txt`.
+The `-modifiers` flag is also accepted as an alias for `-m`.
 
-### Parameters
+If no output file is specified, results are saved to `output-<unix_epoch_time>.txt`.
 
-| Parameter        | Required | Description                                                                                                                                   |
-|------------------|----------|-----------------------------------------------------------------------------------------------------------------------------------------------|
-| `-i`             | Yes      | Input file containing a wordlist (one word per line). These words will be used to generate potential S3 bucket names.                         |
-| `-o`             | No       | Output file for saving results. If not specified, the program will save the results to a file named `output-<unix_epoch_time>.txt`.           |
-| `-t`             | No       | Number of concurrent threads to use for scanning (default: 10). The program automatically adjusts if the specified value exceeds the system’s file descriptor limit. |
-| `-v`             | No       | Enable verbose mode. In verbose mode, each failed request is printed in the terminal.                                                         |
-| `-modifiers`     | No       | An optional modifiers file containing additional modifiers for generating more complex S3 bucket names. These should be listed one per line. If not specified, the program uses a predefined list of common modifiers (e.g., `prod`, `dev`, `test`, `stage`, etc.). |
+## Parameters
 
-### Output
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `-i` | Yes | Input wordlist, one candidate base word per line. Blank lines are ignored. |
+| `-o` | No | Output file for successful probe results. Defaults to `output-<unix_epoch_time>.txt`. |
+| `-m` | No | Modifier file, one modifier per line. Duplicate and blank modifiers are ignored. |
+| `-modifiers` | No | Alias for `-m`. |
+| `-t` | No | Number of concurrent workers. Must be between `1` and `1024`; defaults to `10`. Linux also clamps this below the process file-descriptor limit when available. |
+| `-v` | No | Verbose mode. Prints failed probe URLs. |
 
-The program saves the names of publicly accessible S3 buckets in the specified output file or a file named `output-<unix_epoch_time>.txt` by default. It only prints the bucket name to the console and the file, omitting the full S3 URL.
+## Examples
 
-### Example
+### Basic Scan
 
-#### Basic Example
-```
+```sh
 ./s3scanner -i wordlist.txt -o results.txt
 ```
 
-- Scans using the words from `wordlist.txt` and saves the results to `results.txt`.
+### Verbose Mode
 
-#### Verbose Mode
-```
+```sh
 ./s3scanner -i wordlist.txt -t 20 -v
 ```
 
-- Runs the scanner with 20 threads, enabling verbose logging to show all failed and successful requests in the terminal.
+### Modifier File
 
-#### Using a Modifiers File
+```sh
+./s3scanner -i wordlist.txt -m mods.txt -t 15
 ```
+
+The compatibility alias works too:
+
+```sh
 ./s3scanner -i wordlist.txt -modifiers mods.txt -t 15
 ```
 
-- Scans using the words from `wordlist.txt`, appending modifiers from `mods.txt` to generate more potential bucket names.
+## Output
 
-#### Output File with Unix Epoch
-```
-./s3scanner -i wordlist.txt
-```
-
-- Automatically generates an output file with a name like `output-1725562640.txt`, where `1725562640` is the Unix epoch timestamp at the time the program runs.
+Successful probe results are printed as bucket names and written one per line to the output file. The full probe URL is not written.
 
 ## Statistics and Progress
 
-During the scanning process, the program prints detailed statistics, including:
+During scanning, the CLI prints:
 
-- Total requests made
-- Total successes (i.e., publicly accessible S3 buckets)
-- Total failures
-- Number of active threads
-- Current number of open file descriptors
+- Completed requests
+- Failed requests
+- Successful probe results
+- Active worker count
+- Configured worker limit
+- Open-file telemetry when the platform supports it
 - Overall progress percentage
+
+On non-Linux platforms, open-file telemetry is shown as `n/a`; scanning still continues.
+
+## Verification
+
+Recommended local checks:
+
+```sh
+gofmt -l .
+go test ./...
+go vet ./...
+go build ./...
+govulncheck ./...
+```

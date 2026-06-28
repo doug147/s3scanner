@@ -1,5 +1,5 @@
 module s3scanner
 
-go 1.22.2
+go 1.25.11
 
-require golang.org/x/sys v0.25.0 // indirect
+require golang.org/x/sys v0.46.0

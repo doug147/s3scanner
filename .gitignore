@@ -1,0 +1,27 @@
+# Build outputs
+/bin/
+/build/
+/dist/
+s3scanner
+s3scanner.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# Test and coverage artifacts
+coverage.out
+*.coverprofile
+*.prof
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

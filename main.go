@@ -2,8 +2,11 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,244 +15,416 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+)
 
-	"golang.org/x/sys/unix"
+const (
+	requestTimeout    = 10 * time.Second
+	scannerBufferSize = 1024 * 1024
+	maxWorkerCount    = 1024
 )
 
 var (
-	input_file       string
-	output_file      string
-	modifiers_file   string
-	threads          int
-	verbose          bool
-	modifiers        = []string{}
-	total_requests   int64
-	total_failures   int64
-	total_successes  int64
-	print_lock       sync.Mutex
+	inputFile      string
+	outputFile     string
+	modifiersFile  string
+	threads        int
+	verbose        bool
+	totalRequests  int64
+	totalFailures  int64
+	totalSuccesses int64
+	printLock      sync.Mutex
 )
 
+type candidate struct {
+	BucketName string
+	URL        string
+}
+
 func init() {
-	flag.StringVar(&input_file, "i", "", "Input file containing wordlist")
-	flag.StringVar(&output_file, "o", "", "Output file for results (optional)")
-	flag.StringVar(&modifiers_file, "m", "", "Modifiers file containing modifier list (optional)")
+	flag.StringVar(&inputFile, "i", "", "Input file containing wordlist")
+	flag.StringVar(&outputFile, "o", "", "Output file for results (optional)")
+	flag.StringVar(&modifiersFile, "m", "", "Modifiers file containing modifier list (optional)")
+	flag.StringVar(&modifiersFile, "modifiers", "", "Modifiers file containing modifier list (optional, alias for -m)")
 	flag.IntVar(&threads, "t", 10, "Number of concurrent threads")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose mode")
 }
 
-func print_usage() {
+func printUsage() {
 	fmt.Println("Usage:")
 	fmt.Println("  -i <input file> : Input file containing wordlist (required)")
 	fmt.Println("  -o <output file> : Output file for results (optional)")
 	fmt.Println("  -m <modifiers file> : Modifiers file containing modifier list (optional)")
+	fmt.Println("  -modifiers <modifiers file> : Alias for -m")
 	fmt.Println("  -t <threads> : Number of concurrent threads (default: 10)")
 	fmt.Println("Example:")
 	fmt.Println("  ./s3scanner -i input.txt -o results.txt -t 20")
 }
 
-func check_url(url string, ch chan string, wg *sync.WaitGroup, verbose bool) {
-	defer wg.Done()
-	resp, err := http.Get(url)
-	if err != nil {
-		atomic.AddInt64(&total_failures, 1)
-		if verbose {
-			print_lock.Lock()
-			fmt.Printf("\033[31m[-] %s\033[0m\n", url)
-			print_lock.Unlock()
+func defaultModifiers() []string {
+	return dedupeStrings([]string{
+		"prod", "dev", "qa", "uat", "bucket", "files", "archives", "backup", "backups", "cdn", "test", "stage",
+		"staging", "temp", "temporary", "public", "private", "media", "data", "logs", "images", "assets", "resources",
+		"docs", "documents", "reports", "analytics", "static", "content", "uploads", "downloads", "scripts", "configs",
+		"configurations", "settings", "release", "releases", "home", "app", "apps", "application", "applications",
+		"code", "source", "sources", "library", "libraries", "repo", "repos", "repository", "repositories", "env",
+		"environment", "environments", "db", "database", "databases", "cache", "caches", "archive", "archives", "backup",
+		"backups", "cdn", "proxy", "proxies", "service", "services", "api", "apis", "v1", "v2", "v3", "main", "mainnet",
+		"testnet", "development", "production", "integration", "live", "snapshot", "snapshots", "audit", "audits", "log",
+		"logs", "metrics", "metric", "tracking", "tracker", "tracers", "trace", "traces", "user", "users", "account",
+		"accounts", "session", "sessions", "activity", "activities", "event", "events", "transaction", "transactions",
+		"billing", "invoice", "invoices", "customer", "customers", "client", "clients", "partner", "partners", "vendor",
+		"vendors", "supplier", "suppliers", "inventory", "inventories", "order", "orders", "purchase", "purchases",
+		"sale", "sales", "discount", "discounts", "coupon", "coupons", "offer", "offers", "deal", "deals", "promo",
+		"promos", "promotion", "promotions",
+	})
+}
+
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	deduped := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
 		}
-		return
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		deduped = append(deduped, value)
+	}
+	return deduped
+}
+
+func loadModifiers(path string) ([]string, error) {
+	if path == "" {
+		return defaultModifiers(), nil
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open modifiers file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := newLineScanner(file)
+	modifiers := make([]string, 0)
+	for scanner.Scan() {
+		modifiers = append(modifiers, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading modifiers file: %w", err)
+	}
+	return dedupeStrings(modifiers), nil
+}
+
+func buildBucketURL(bucketName string) string {
+	return fmt.Sprintf("https://%s.s3.amazonaws.com/?uploads=", bucketName)
+}
+
+func generateCandidates(word string, modifiers []string) []candidate {
+	word = strings.TrimSpace(word)
+	if word == "" {
+		return nil
+	}
+
+	candidates := []candidate{{BucketName: word, URL: buildBucketURL(word)}}
+	for _, mod := range modifiers {
+		for _, bucketName := range []string{
+			fmt.Sprintf("%s-%s", mod, word),
+			fmt.Sprintf("%s%s", mod, word),
+			fmt.Sprintf("%s-%s", word, mod),
+			fmt.Sprintf("%s%s", word, mod),
+		} {
+			candidates = append(candidates, candidate{
+				BucketName: bucketName,
+				URL:        buildBucketURL(bucketName),
+			})
+		}
+	}
+	return candidates
+}
+
+func candidatesPerWord(modifiers []string) int {
+	return 1 + len(modifiers)*4
+}
+
+func newLineScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 1024), scannerBufferSize)
+	return scanner
+}
+
+func countWords(file *os.File) (int, error) {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+
+	scanner := newLineScanner(file)
+	count := 0
+	for scanner.Scan() {
+		if strings.TrimSpace(scanner.Text()) != "" {
+			count++
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, err
+	}
+	_, err := file.Seek(0, io.SeekStart)
+	return count, err
+}
+
+func normalizeThreadCount(requested int) (int, error) {
+	if requested < 1 {
+		return 0, fmt.Errorf("thread count must be at least 1")
+	}
+	if requested > maxWorkerCount {
+		requested = maxWorkerCount
+	}
+
+	maxFiles, supported, err := maxOpenFiles()
+	if err != nil || !supported {
+		return requested, nil
+	}
+
+	maxThreads := maxFiles - 10
+	if maxThreads < 1 {
+		maxThreads = 1
+	}
+	if requested > maxThreads {
+		return maxThreads, nil
+	}
+	return requested, nil
+}
+
+func produceCandidates(ctx context.Context, file *os.File, modifiers []string, jobs chan<- candidate) error {
+	scanner := newLineScanner(file)
+	for scanner.Scan() {
+		for _, candidate := range generateCandidates(scanner.Text(), modifiers) {
+			select {
+			case jobs <- candidate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return scanner.Err()
+}
+
+func checkCandidate(ctx context.Context, client *http.Client, candidate candidate, verbose bool) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, candidate.URL, nil)
+	if err != nil {
+		atomic.AddInt64(&totalRequests, 1)
+		atomic.AddInt64(&totalFailures, 1)
+		printFailure(candidate.URL, verbose)
+		return false
+	}
+
+	resp, err := client.Do(req)
+	atomic.AddInt64(&totalRequests, 1)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			atomic.AddInt64(&totalFailures, 1)
+			printFailure(candidate.URL, verbose)
+		}
+		return false
 	}
 	defer resp.Body.Close()
 
-	atomic.AddInt64(&total_requests, 1)
-
 	if resp.StatusCode == http.StatusOK {
-		atomic.AddInt64(&total_successes, 1)
-		bucket_name := strings.Split(url, ".")[0][8:]
-		ch <- bucket_name
-	} else {
-		atomic.AddInt64(&total_failures, 1)
-		if verbose {
-			print_lock.Lock()
-			fmt.Printf("\033[31m[-] %s\033[0m\n", url)
-			print_lock.Unlock()
+		atomic.AddInt64(&totalSuccesses, 1)
+		return true
+	}
+
+	atomic.AddInt64(&totalFailures, 1)
+	printFailure(candidate.URL, verbose)
+	return false
+}
+
+func printFailure(url string, verbose bool) {
+	if !verbose {
+		return
+	}
+	printLock.Lock()
+	defer printLock.Unlock()
+	fmt.Printf("\033[31m[-] %s\033[0m\n", url)
+}
+
+func writeFinding(w io.Writer, bucketName string) error {
+	_, err := w.Write([]byte(bucketName + "\n"))
+	return err
+}
+
+func consumeResults(results <-chan string, out io.Writer, cancel context.CancelFunc) error {
+	var writeErr error
+	for bucketName := range results {
+		printLock.Lock()
+		fmt.Printf("\r\033[K[+] %s\n", bucketName)
+		printLock.Unlock()
+		if err := writeFinding(out, bucketName); err != nil && writeErr == nil {
+			writeErr = fmt.Errorf("failed to write result: %w", err)
+			cancel()
 		}
 	}
+	return writeErr
 }
 
-func get_current_open_files() (int, error) {
-	data, err := os.ReadFile("/proc/sys/fs/file-nr")
-	if err != nil {
-		return 0, err
-	}
-	parts := strings.Fields(string(data))
-	if len(parts) < 1 {
-		return 0, fmt.Errorf("unexpected content in /proc/sys/fs/file-nr")
-	}
-	open_files, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return 0, err
-	}
-	return open_files, nil
-}
-
-func display_stats(total_urls int, sem chan struct{}, stop chan struct{}) {
+func displayStats(totalCandidates int, maxThreads int, activeWorkers *int64, stop <-chan struct{}) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	var rlimit unix.Rlimit
-	err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit)
-	if err != nil {
-		log.Fatalf("Error getting file descriptor limit: %v", err)
+	maxOpenFilesText := "n/a"
+	if maxFiles, supported, err := maxOpenFiles(); err == nil && supported {
+		maxOpenFilesText = strconv.Itoa(maxFiles)
 	}
-
-	max_open_files := int(rlimit.Cur)
 
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
-			current_open_files, err := get_current_open_files()
-			if err != nil {
-				log.Printf("Error getting current open files: %v", err)
-				continue
+			currentOpenFilesText := "n/a"
+			if currentFiles, supported, err := currentOpenFiles(); err == nil && supported {
+				currentOpenFilesText = strconv.Itoa(currentFiles)
 			}
-			current_threads := threads - len(sem)
-			progress := float64(atomic.LoadInt64(&total_requests)) / float64(total_urls) * 100
+			progress := progressPercent(totalCandidates)
 
-			print_lock.Lock()
-			fmt.Printf("\r\033[KTotal requests: %d | Total failures: %d | Total successes: %d | Current threads: %d | Max threads: %d | Current open files: %d | Max open files: %d | Progress: %.2f%%",
-				atomic.LoadInt64(&total_requests),
-				atomic.LoadInt64(&total_failures),
-				atomic.LoadInt64(&total_successes),
-				current_threads,
-				threads,
-				current_open_files,
-				max_open_files,
+			printLock.Lock()
+			fmt.Printf("\r\033[KTotal requests: %d | Total failures: %d | Total successes: %d | Current threads: %d | Max threads: %d | Current open files: %s | Max open files: %s | Progress: %.2f%%",
+				atomic.LoadInt64(&totalRequests),
+				atomic.LoadInt64(&totalFailures),
+				atomic.LoadInt64(&totalSuccesses),
+				atomic.LoadInt64(activeWorkers),
+				maxThreads,
+				currentOpenFilesText,
+				maxOpenFilesText,
 				progress)
-			print_lock.Unlock()
+			printLock.Unlock()
 		}
 	}
 }
 
-func load_modifiers() {
-	if modifiers_file != "" {
-		file, err := os.Open(modifiers_file)
-		if err != nil {
-			log.Fatalf("Failed to open modifiers file: %v", err)
-		}
-		defer file.Close()
-
-		scanner := bufio.NewScanner(file)
-		for scanner.Scan() {
-			modifiers = append(modifiers, scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			log.Fatalf("Error reading modifiers file: %v", err)
-		}
-	} else {
-		modifiers      = []string{
-			"prod", "dev", "qa", "uat", "bucket", "files", "archives", "backup", "backups", "cdn", "test", "stage",
-			"staging", "temp", "temporary", "public", "private", "media", "data", "logs", "images", "assets", "resources",
-			"docs", "documents", "reports", "analytics", "static", "content", "uploads", "downloads", "scripts", "configs",
-			"configurations", "settings", "release", "releases", "home", "app", "apps", "application", "applications",
-			"code", "source", "sources", "library", "libraries", "repo", "repos", "repository", "repositories", "env",
-			"environment", "environments", "db", "database", "databases", "cache", "caches", "archive", "archives", "backup",
-			"backups", "cdn", "proxy", "proxies", "service", "services", "api", "apis", "v1", "v2", "v3", "main", "mainnet",
-			"testnet", "development", "production", "integration", "live", "snapshot", "snapshots", "audit", "audits", "log",
-			"logs", "metrics", "metric", "tracking", "tracker", "tracers", "trace", "traces", "user", "users", "account",
-			"accounts", "session", "sessions", "activity", "activities", "event", "events", "transaction", "transactions",
-			"billing", "invoice", "invoices", "customer", "customers", "client", "clients", "partner", "partners", "vendor",
-			"vendors", "supplier", "suppliers", "inventory", "inventories", "order", "orders", "purchase", "purchases",
-			"sale", "sales", "discount", "discounts", "coupon", "coupons", "offer", "offers", "deal", "deals", "promo",
-			"promos", "promotion", "promotions",
-		}
+func progressPercent(totalCandidates int) float64 {
+	if totalCandidates <= 0 {
+		return 100
 	}
+	return float64(atomic.LoadInt64(&totalRequests)) / float64(totalCandidates) * 100
+}
+
+func runScan(inputPath, outputPath, modifiersPath string, requestedThreads int, verbose bool, client *http.Client) error {
+	resetScanStats()
+
+	if inputPath == "" {
+		printUsage()
+		return fmt.Errorf("missing required input file")
+	}
+	if outputPath == "" {
+		outputPath = fmt.Sprintf("output-%d.txt", time.Now().Unix())
+	}
+	if client == nil {
+		client = &http.Client{Timeout: requestTimeout}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	modifiers, err := loadModifiers(modifiersPath)
+	if err != nil {
+		return err
+	}
+
+	workerCount, err := normalizeThreadCount(requestedThreads)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Open(inputPath)
+	if err != nil {
+		return fmt.Errorf("failed to open input file: %w", err)
+	}
+	defer file.Close()
+
+	wordCount, err := countWords(file)
+	if err != nil {
+		return fmt.Errorf("failed to count input words: %w", err)
+	}
+	totalCandidates := wordCount * candidatesPerWord(modifiers)
+
+	outFile, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+
+	jobs := make(chan candidate, workerCount*2)
+	results := make(chan string, workerCount)
+	stopStats := make(chan struct{})
+	producerErr := make(chan error, 1)
+	var wg sync.WaitGroup
+	var activeWorkers int64
+
+	go displayStats(totalCandidates, workerCount, &activeWorkers, stopStats)
+
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case candidate, ok := <-jobs:
+					if !ok {
+						return
+					}
+					atomic.AddInt64(&activeWorkers, 1)
+					if checkCandidate(ctx, client, candidate, verbose) {
+						select {
+						case results <- candidate.BucketName:
+						case <-ctx.Done():
+						}
+					}
+					atomic.AddInt64(&activeWorkers, -1)
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		producerErr <- produceCandidates(ctx, file, modifiers, jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+		close(stopStats)
+	}()
+
+	writeErr := consumeResults(results, outFile, cancel)
+
+	closeErr := outFile.Close()
+	fmt.Printf("\r\033[K")
+
+	if err := <-producerErr; err != nil && writeErr == nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("error reading input file: %w", err)
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close output file: %w", closeErr)
+	}
+	return nil
+}
+
+func resetScanStats() {
+	atomic.StoreInt64(&totalRequests, 0)
+	atomic.StoreInt64(&totalFailures, 0)
+	atomic.StoreInt64(&totalSuccesses, 0)
 }
 
 func main() {
 	flag.Parse()
-
-	if input_file == "" {
-		print_usage()
-		log.Fatal("Missing required input file")
+	if err := runScan(inputFile, outputFile, modifiersFile, threads, verbose, nil); err != nil {
+		log.Fatal(err)
 	}
-
-	if output_file == "" {
-		output_file = fmt.Sprintf("output-%d.txt", time.Now().Unix())
-	}
-
-	load_modifiers()
-
-	file, err := os.Open(input_file)
-	if err != nil {
-		log.Fatalf("Failed to open input file: %v", err)
-	}
-	defer file.Close()
-
-	out_file, err := os.Create(output_file)
-	if err != nil {
-		log.Fatalf("Failed to create output file: %v", err)
-	}
-	defer out_file.Close()
-
-	scanner := bufio.NewScanner(file)
-	urls := make([]string, 0)
-	for scanner.Scan() {
-		word := scanner.Text()
-		urls = append(urls, fmt.Sprintf("https://%s.s3.amazonaws.com/?uploads=", word))
-		for _, mod := range modifiers {
-			urls = append(urls, fmt.Sprintf("https://%s-%s.s3.amazonaws.com/?uploads=", mod, word))
-			urls = append(urls, fmt.Sprintf("https://%s%s.s3.amazonaws.com/?uploads=", mod, word))
-			urls = append(urls, fmt.Sprintf("https://%s-%s.s3.amazonaws.com/?uploads=", word, mod))
-			urls = append(urls, fmt.Sprintf("https://%s%s.s3.amazonaws.com/?uploads=", word, mod))
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Fatalf("Error reading input file: %v", err)
-	}
-
-	var rlimit unix.Rlimit
-	err = unix.Getrlimit(unix.RLIMIT_NOFILE, &rlimit)
-	if err != nil {
-		log.Fatalf("Error getting file descriptor limit: %v", err)
-	}
-
-	max_threads := int(rlimit.Cur) - 10
-	if threads > max_threads {
-		threads = max_threads
-	}
-
-	ch := make(chan string, len(urls))
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-
-	sem := make(chan struct{}, threads)
-
-	go display_stats(len(urls), sem, stop)
-
-	for _, url := range urls {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(url string) {
-			defer func() { <-sem }()
-			check_url(url, ch, &wg, verbose)
-		}(url)
-	}
-
-	go func() {
-		wg.Wait()
-		close(ch)
-		close(stop)
-	}()
-
-	for bucket_name := range ch {
-		print_lock.Lock()
-		fmt.Printf("\r\033[K[+] %s\n", bucket_name)
-		print_lock.Unlock()
-		out_file.WriteString(bucket_name + "\n")
-	}
-	fmt.Printf("\r\033[K")
 }
