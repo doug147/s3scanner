@@ -19,9 +19,11 @@ import (
 )
 
 const (
-	requestTimeout    = 10 * time.Second
-	scannerBufferSize = 1024 * 1024
-	maxWorkerCount    = 1024
+	requestTimeout               = 10 * time.Second
+	scannerBufferSize            = 1024 * 1024
+	maxWorkerCount               = 1024
+	singleModifierCandidateForms = 6
+	envRegionCandidateForms      = 4
 )
 
 var (
@@ -39,6 +41,12 @@ var (
 type candidate struct {
 	BucketName string
 	URL        string
+}
+
+type candidateOptions struct {
+	modifiers         []string
+	comboEnvironments []string
+	comboRegions      []string
 }
 
 func init() {
@@ -77,6 +85,43 @@ func defaultModifiers() []string {
 		"vendors", "supplier", "suppliers", "inventory", "inventories", "order", "orders", "purchase", "purchases",
 		"sale", "sales", "discount", "discounts", "coupon", "coupons", "offer", "offers", "deal", "deals", "promo",
 		"promos", "promotion", "promotions",
+		"prd", "preprod", "pre-prod", "nonprod", "non-prod", "sbx", "sandbox", "demo", "beta", "alpha", "perf",
+		"performance", "load", "stress", "e2e", "int", "internal", "external", "s3", "aws", "cloud", "cloudfront",
+		"cf", "origin", "edge", "terraform", "tf", "tfstate", "terraform-state", "state", "remote-state", "artifact",
+		"artifacts", "build", "builds", "dist", "package", "packages", "deploy", "deploys", "deployment", "deployments",
+		"installer", "installers", "dump", "dumps", "export", "exports", "import", "imports", "migration", "migrations",
+		"web", "website", "site", "portal", "admin", "console", "frontend", "backend", "backend-assets", "lambda",
+		"ecs", "eks", "k8s", "helm", "docker", "container", "containers", "cloudtrail", "trail", "trails", "access-logs",
+		"elb-logs", "alb-logs", "waf-logs", "athena", "athena-results", "query-results", "secure", "security",
+		"compliance", "pii", "vault", "secrets", "keys", "us", "us-east-1", "us-west-2", "eu-west-1",
+		"stg", "pre", "preview", "review", "canary", "blue", "green", "dr", "recovery", "restore", "shared",
+		"common", "global", "central", "core", "platform", "infra", "infrastructure", "ops", "operations",
+		"engineering", "eng", "accesslogs", "server-access-logs", "s3-logs", "s3-access-logs", "cloudwatch",
+		"cwlogs", "vpc-flow-logs", "flowlogs", "guardduty", "securityhub", "aws-config", "config", "firehose",
+		"kinesis-firehose", "cloudformation", "cfn", "sam", "serverless", "codepipeline", "codebuild", "codedeploy",
+		"glue", "emr", "redshift", "rds", "dynamodb", "kinesis", "sagemaker", "quicksight", "ecr", "lake",
+		"datalake", "data-lake", "warehouse", "lakehouse", "raw", "curated", "processed", "bronze", "silver",
+		"gold", "landing", "ingest", "ingestion", "etl", "elt", "pipeline", "pipelines", "parquet", "csv", "json",
+		"us-east-2", "us-west-1", "eu-west-2", "eu-west-3", "eu-central-1", "eu-north-1", "ap-south-1",
+		"ap-southeast-1", "ap-southeast-2", "ap-northeast-1", "ap-northeast-2", "ca-central-1", "sa-east-1",
+		"use1", "use2", "usw1", "usw2", "euw1", "euw2", "euc1", "aps1", "apse1", "apse2", "apne1",
+	})
+}
+
+func defaultComboEnvironments() []string {
+	return dedupeStrings([]string{
+		"prod", "prd", "production", "dev", "development", "qa", "test", "stage", "staging", "stg", "uat", "pre",
+		"preprod", "pre-prod", "nonprod", "non-prod", "sandbox", "sbx", "demo", "beta", "alpha", "perf",
+		"performance",
+	})
+}
+
+func defaultComboRegions() []string {
+	return dedupeStrings([]string{
+		"us", "us-east-1", "us-east-2", "us-west-1", "us-west-2", "eu-west-1", "eu-west-2", "eu-west-3",
+		"eu-central-1", "eu-north-1", "ap-south-1", "ap-southeast-1", "ap-southeast-2", "ap-northeast-1",
+		"ap-northeast-2", "ca-central-1", "sa-east-1", "use1", "use2", "usw1", "usw2", "euw1", "euw2", "euc1",
+		"aps1", "apse1", "apse2", "apne1",
 	})
 }
 
@@ -119,35 +164,84 @@ func loadModifiers(path string) ([]string, error) {
 	return dedupeStrings(modifiers), nil
 }
 
+func loadCandidateOptions(path string) (candidateOptions, error) {
+	modifiers, err := loadModifiers(path)
+	if err != nil {
+		return candidateOptions{}, err
+	}
+
+	options := candidateOptions{modifiers: modifiers}
+	if path == "" {
+		options.comboEnvironments = defaultComboEnvironments()
+		options.comboRegions = defaultComboRegions()
+	}
+	return options, nil
+}
+
 func buildBucketURL(bucketName string) string {
 	return fmt.Sprintf("https://%s.s3.amazonaws.com/?uploads=", bucketName)
 }
 
 func generateCandidates(word string, modifiers []string) []candidate {
+	return generateCandidatesWithOptions(word, candidateOptions{modifiers: modifiers})
+}
+
+func generateCandidatesWithOptions(word string, options candidateOptions) []candidate {
 	word = strings.TrimSpace(word)
 	if word == "" {
 		return nil
 	}
 
 	candidates := []candidate{{BucketName: word, URL: buildBucketURL(word)}}
-	for _, mod := range modifiers {
-		for _, bucketName := range []string{
-			fmt.Sprintf("%s-%s", mod, word),
-			fmt.Sprintf("%s%s", mod, word),
-			fmt.Sprintf("%s-%s", word, mod),
-			fmt.Sprintf("%s%s", word, mod),
-		} {
+	for _, mod := range options.modifiers {
+		for _, bucketName := range modifierBucketNames(word, mod) {
 			candidates = append(candidates, candidate{
 				BucketName: bucketName,
 				URL:        buildBucketURL(bucketName),
 			})
 		}
 	}
+	for _, env := range options.comboEnvironments {
+		for _, region := range options.comboRegions {
+			for _, bucketName := range envRegionBucketNames(word, env, region) {
+				candidates = append(candidates, candidate{
+					BucketName: bucketName,
+					URL:        buildBucketURL(bucketName),
+				})
+			}
+		}
+	}
 	return candidates
 }
 
+func modifierBucketNames(word, mod string) []string {
+	return []string{
+		fmt.Sprintf("%s-%s", mod, word),
+		fmt.Sprintf("%s%s", mod, word),
+		fmt.Sprintf("%s.%s", mod, word),
+		fmt.Sprintf("%s-%s", word, mod),
+		fmt.Sprintf("%s%s", word, mod),
+		fmt.Sprintf("%s.%s", word, mod),
+	}
+}
+
+func envRegionBucketNames(word, env, region string) []string {
+	return []string{
+		fmt.Sprintf("%s-%s-%s", word, env, region),
+		fmt.Sprintf("%s-%s-%s", env, word, region),
+		fmt.Sprintf("%s.%s.%s", word, env, region),
+		fmt.Sprintf("%s.%s.%s", env, word, region),
+	}
+}
+
 func candidatesPerWord(modifiers []string) int {
-	return 1 + len(modifiers)*4
+	return 1 + len(modifiers)*singleModifierCandidateForms
+}
+
+func candidatesPerWordWithOptions(options candidateOptions) int {
+	return 1 +
+		len(options.modifiers)*singleModifierCandidateForms +
+		len(options.comboEnvironments)*len(options.comboRegions)*envRegionCandidateForms
 }
 
 func newLineScanner(r io.Reader) *bufio.Scanner {
@@ -260,10 +354,10 @@ func normalizeThreadCount(requested int) (int, error) {
 	return requested, nil
 }
 
-func produceCandidates(ctx context.Context, file *os.File, modifiers []string, jobs chan<- candidate) error {
+func produceCandidates(ctx context.Context, file *os.File, options candidateOptions, jobs chan<- candidate) error {
 	scanner := newLineScanner(file)
 	for scanner.Scan() {
-		for _, candidate := range generateCandidates(scanner.Text(), modifiers) {
+		for _, candidate := range generateCandidatesWithOptions(scanner.Text(), options) {
 			select {
 			case jobs <- candidate:
 			case <-ctx.Done():
@@ -390,7 +484,7 @@ func runScan(inputPath, outputPath, modifiersPath string, requestedThreads int, 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	modifiers, err := loadModifiers(modifiersPath)
+	options, err := loadCandidateOptions(modifiersPath)
 	if err != nil {
 		return err
 	}
@@ -410,7 +504,7 @@ func runScan(inputPath, outputPath, modifiersPath string, requestedThreads int, 
 	if err != nil {
 		return fmt.Errorf("failed to count input words: %w", err)
 	}
-	totalCandidates := wordCount * candidatesPerWord(modifiers)
+	totalCandidates := wordCount * candidatesPerWordWithOptions(options)
 
 	outFile, err := os.Create(outputPath)
 	if err != nil {
@@ -453,7 +547,7 @@ func runScan(inputPath, outputPath, modifiersPath string, requestedThreads int, 
 
 	go func() {
 		defer close(jobs)
-		producerErr <- produceCandidates(ctx, file, modifiers, jobs)
+		producerErr <- produceCandidates(ctx, file, options, jobs)
 	}()
 
 	go func() {

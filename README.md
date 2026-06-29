@@ -51,6 +51,33 @@ If no output file is specified, results are saved to `output-<unix_epoch_time>.t
 | `-t` | No | Number of concurrent workers. Must be between `1` and `1024`; defaults to `10`. Linux also clamps this below the process file-descriptor limit when available. |
 | `-v` | No | Verbose mode. Prints failed probe URLs. |
 
+## Candidate Generation
+
+For each nonblank input word `word`, the scanner probes the raw word plus six variants for every modifier:
+
+```text
+word
+modifier-word
+modifierword
+modifier.word
+word-modifier
+wordmodifier
+word.modifier
+```
+
+The built-in default list includes common environment names, S3/AWS terms, Terraform state terms, build/deploy artifacts, import/export and migration names, web/app terms, container/orchestration terms, log/query-result buckets, security terms, region names, and compound environment-region names.
+
+When using the built-in default list, the scanner also generates common environment-region combinations:
+
+```text
+word-environment-region
+environment-word-region
+word.environment.region
+environment.word.region
+```
+
+With the built-in defaults, this produces 4,497 candidates per input word. A custom `-m` / `-modifiers` file replaces the built-in modifier and environment-region sets, so custom scans use only the six single-modifier forms shown above.
+
 ## Examples
 
 ### Basic Scan

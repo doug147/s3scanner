@@ -45,8 +45,10 @@ func TestGenerateCandidatesPreservesDottedBucketNames(t *testing.T) {
 		"my.bucket",
 		"prod-my.bucket",
 		"prodmy.bucket",
+		"prod.my.bucket",
 		"my.bucket-prod",
 		"my.bucketprod",
+		"my.bucket.prod",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("candidate count = %d, want %d: %#v", len(got), len(want), got)
@@ -55,6 +57,128 @@ func TestGenerateCandidatesPreservesDottedBucketNames(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("candidate[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestGenerateCandidatesIncludesWebSuffixAndDotForms(t *testing.T) {
+	candidates := generateCandidates("example", []string{"web"})
+	got := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		got = append(got, candidate.BucketName)
+	}
+
+	want := []string{
+		"example",
+		"web-example",
+		"webexample",
+		"web.example",
+		"example-web",
+		"exampleweb",
+		"example.web",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidate count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidate[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestDefaultModifiersIncludeExpandedAWSAndRegionPatterns(t *testing.T) {
+	modifiers := defaultModifiers()
+	seen := map[string]struct{}{}
+	for _, modifier := range modifiers {
+		seen[modifier] = struct{}{}
+	}
+
+	for _, modifier := range []string{
+		"prd",
+		"s3",
+		"tfstate",
+		"access-logs",
+		"us-east-1",
+		"stg",
+		"server-access-logs",
+		"cloudformation",
+		"data-lake",
+		"us-east-2",
+		"use1",
+		"json",
+	} {
+		if _, exists := seen[modifier]; !exists {
+			t.Fatalf("default modifier %q not found", modifier)
+		}
+	}
+}
+
+func TestGenerateCandidatesWithOptionsIncludesEnvironmentRegionCombos(t *testing.T) {
+	options := candidateOptions{
+		modifiers:         []string{"web"},
+		comboEnvironments: []string{"prod"},
+		comboRegions:      []string{"us-east-1"},
+	}
+	candidates := generateCandidatesWithOptions("example", options)
+	got := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		got = append(got, candidate.BucketName)
+	}
+
+	want := []string{
+		"example",
+		"web-example",
+		"webexample",
+		"web.example",
+		"example-web",
+		"exampleweb",
+		"example.web",
+		"example-prod-us-east-1",
+		"prod-example-us-east-1",
+		"example.prod.us-east-1",
+		"prod.example.us-east-1",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("candidate count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidate[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCandidatesPerWordCountsDottedForms(t *testing.T) {
+	if got, want := candidatesPerWord([]string{"prod", "dev"}), 13; got != want {
+		t.Fatalf("candidatesPerWord = %d, want %d", got, want)
+	}
+}
+
+func TestCandidatesPerWordWithOptionsCountsEnvironmentRegionCombos(t *testing.T) {
+	options := candidateOptions{
+		modifiers:         []string{"prod", "web"},
+		comboEnvironments: []string{"prod", "dev"},
+		comboRegions:      []string{"us-east-1", "use1"},
+	}
+	candidates := generateCandidatesWithOptions("example", options)
+
+	if got, want := candidatesPerWordWithOptions(options), len(candidates); got != want {
+		t.Fatalf("candidatesPerWordWithOptions = %d, want %d", got, want)
+	}
+}
+
+func TestDefaultCandidateOptionsDoNotGenerateDuplicateBucketNames(t *testing.T) {
+	options, err := loadCandidateOptions("")
+	if err != nil {
+		t.Fatalf("loadCandidateOptions returned error: %v", err)
+	}
+
+	seen := map[string]struct{}{}
+	for _, candidate := range generateCandidatesWithOptions("example", options) {
+		if _, exists := seen[candidate.BucketName]; exists {
+			t.Fatalf("duplicate candidate %q", candidate.BucketName)
+		}
+		seen[candidate.BucketName] = struct{}{}
 	}
 }
 
